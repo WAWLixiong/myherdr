@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""
+Herdr Agent Status Monitor - Windows Version
+
+A Python script that connects to Herdr's socket API and subscribes to
+agent status change events, printing them in real-time.
+
+Requirements:
+    - Python 3.7+
+    - Optional: pip install pydantic
+
+Usage:
+    python herdr_agent_status_monitor.py
+
+Features:
+    - Connect to Herdr socket (Windows named pipe or Unix socket)
+    - Subscribe to pane and workspace events
+    - Monitor agent status changes in real-time
+    - Pretty print event information with timestamps
+"""
+
+import json
+import socket
+import os
+import sys
+import time
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, Any
+from enum import Enum
+
+
+class AgentState(Enum):
+    """Agent states"""
+    IDLE = "idle"
+    WORKING = "working"
+    PAUSED = "paused"
+    BLOCKED = "blocked"
+
+
+class EventKind(Enum):
+    """Herdr event types related to agents"""
+    PANE_AGENT_REPORTED = "pane.agent_reported"
+    PANE_STATUS_CHANGED = "pane.status_changed"
+    PANE_OUTPUT_CHANGED = "pane.output_changed"
+    WORKSPACE_CREATED = "workspace.created"
+    WORKTREE_CREATED = "worktree.created"
+
+
+class HerdrEventMonitor:
+    """Monitor for Herdr agent status events"""
+    
+    def __init__(self, socket_path: Optional[str] = None):
+        """
+        Initialize Herdr event monitor.
+        
+        Args:
+            socket_path: Path to Herdr socket. Auto-detects if None.
+        """
+        self.socket_path = socket_path or self._detect_socket_path()
+        self.socket: Optional[socket.socket] = None
+        self.buffer = ""
+        self.request_counter = 0
+        self.running = False
+        self.agent_states: Dict[str, Dict[str, Any]] = {}  # Track agent states
+        
+    def _detect_socket_path(self) -> str:
+        """Detect Herdr socket path"""
+        # Check HERDR_SOCKET_PATH environment variable
+        if "HERDR_SOCKET_PATH" in os.environ:
+            path = os.environ["HERDR_SOCKET_PATH"]
+            print(f"[*] Using HERDR_SOCKET_PATH: {path}")
+            return path
+        
+        # Windows named pipe
+        if sys.platform == "win32":
+            return r"\\.\pipe\herdr"
+        
+        # Linux/Mac Unix socket
+        socket_file = Path.home() / ".config" / "herdr" / "herdr.sock"
+        if socket_file.exists():
+            return str(socket_file)
+        
+        # Try alternative location
+        socket_file = Path.home() / ".herdr" / "herdr.sock"
+        if socket_file.exists():
+            return str(socket_file)
+        
+        return str(socket_file)  # Return default even if doesn't exist
+    
+    def connect(self) -> bool:
+        """Connect to Herdr socket"""
+        try:
+            self._print_header(f"Connecting to Herdr", "info")
+            print(f"Socket path: {self.socket_path}\n")
+            
+            # Create socket based on platform
+            if sys.platform == "win32":
+                # Windows: Try multiple connection methods
+                if not self._connect_windows():
+                    return False
+            else:
+                # Unix: Standard socket connection
+                self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.socket.connect(self.socket_path)
+                self.socket.setblocking(True)
+            
+            self._print_status("Connected successfully", "success")
+            return True
+            
+        except FileNotFoundError as e:
+            self._print_status(f"Socket file not found: {e}", "error")
+            return False
+        except ConnectionRefusedError as e:
+            self._print_status(f"Connection refused: {e}", "error")
+            return False
+        except Exception as e:
+            self._print_status(f"Connection error: {e}", "error")
+            return False
+    
+    def _connect_windows(self) -> bool:
+        """Windows-specific connection logic"""
+        # On Windows, Herdr may expose a socket on localhost
+        # Try common ports and methods
+        
+        # Method 1: Try TCP socket on localhost
+        for port in [7777, 12345, 9999]:
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.settimeout(2)
+                self.socket.connect(("127.0.0.1", port))
+                self.socket.setblocking(True)
+                print(f"[+] Connected to localhost:{port}")
+                return True
+            except (socket.timeout, ConnectionRefusedError):
+                if self.socket:
+                    self.socket.close()
+                continue
+        
+        # Method 2: Try Windows named pipe (requires winpipe module or special handling)
+        try:
+            import winpipe
+            self.socket = winpipe.PipeClient(r"\\.\pipe\herdr")
+            return True
+        except ImportError:
+            pass
+        
+        # Method 3: Socket on Unix path (WSL or MSYS2)
+        try:
+            self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.socket.connect(str(Path.home() / ".config" / "herdr" / "herdr.sock"))
+            return True
+        except Exception:
+            pass
+        
+        return False
+    
+    def disconnect(self):
+        """Disconnect from Herdr"""
+        if self.socket:
+            try:
+                self.socket.close()
+                self._print_status("Disconnected from Herdr", "info")
+            except Exception as e:
+                self._print_status(f"Error closing socket: {e}", "warning")
+            self.socket = None
+    
+    def send_request(self, method: str, params: Optional[Dict[str, Any]] = None) -> str:
+        """Send request to Herdr"""
+        self.request_counter += 1
+        request_id = f"monitor-{self.request_counter}"
+        
+        request = {
+            "id": request_id,
+            "method": method,
+        }
+        
+        if params:
+            request["params"] = params
+        
+        try:
+            request_json = json.dumps(request)
+            self.socket.sendall(request_json.encode('utf-8') + b'\n')
+            print(f"[>] Request {request_id}: {method}")
+            return request_id
+        except Exception as e:
+            self._print_status(f"Error sending request: {e}", "error")
+            return ""
+    
+    def read_message(self, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Read one JSON message from socket"""
+        try:
+            if timeout is not None:
+                self.socket.settimeout(timeout)
+            
+            while True:
+                try:
+                    data = self.socket.recv(8192)
+                    if not data:
+                        return None
+                    
+                    self.buffer += data.decode('utf-8', errors='replace')
+                    
+                    # Try to extract complete JSON messages
+                    while '\n' in self.buffer:
+                        line, self.buffer = self.buffer.split('\n', 1)
+                        line = line.strip()
+                        if line:
+                            try:
+                                return json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                
+                except socket.timeout:
+                    return None
+                    
+        except Exception as e:
+            print(f"[!] Error reading message: {e}")
+            return None
+    
+    def subscribe_events(self) -> bool:
+        """Subscribe to Herdr events"""
+        print("\n[*] Subscribing to events...\n")
+        
+        # Subscribe to pane events
+        request_id = self.send_request("pane.subscribe")
+        response = self.read_message(timeout=5.0)
+        if response and "result" in response:
+            print(f"[<] Subscription successful\n")
+            return True
+        
+        print("[!] Subscription response not received\n")
+        return False
+    
+    def run(self):
+        """Main event loop"""
+        self.running = True
+        self._print_header("Listening for Agent Status Changes", "info")
+        print("Press Ctrl+C to stop\n")
+        
+        try:
+            while self.running:
+                message = self.read_message(timeout=None)
+                
+                if message is None:
+                    continue
+                
+                # Process and display the message
+                self._process_message(message)
+                
+        except KeyboardInterrupt:
+            print("\n\n[*] Stopping listener...")
+            self.running = False
+        except Exception as e:
+            self._print_status(f"Error in event loop: {e}", "error")
+    
+    def _process_message(self, message: Dict[str, Any]):
+        """Process incoming message"""
+        # Filter for agent-related events
+        message_str = json.dumps(message)
+        
+        # Check for agent status changes
+        has_agent_info = any(key in message_str for key in [
+            'agent', 'pane_agent', 'status', 'state', 'working', 'idle'
+        ])
+        
+        if has_agent_info:
+            self._display_agent_event(message)
+        else:
+            # Display other events for debugging
+            self._display_generic_event(message)
+    
+    def _display_agent_event(self, message: Dict[str, Any]):
+        """Display agent status change event"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        print(f"\n{'='*75}")
+        print(f"[{timestamp}] 🤖 AGENT STATUS CHANGE")
+        print(f"{'='*75}")
+        
+        # Try to extract structured information
+        if 'result' in message:
+            result = message['result']
+            self._print_event_data(result)
+        
+        if 'data' in message:
+            self._print_event_data(message['data'])
+        
+        # Print full message for debugging
+        if '--verbose' in sys.argv:
+            print("\nFull Message:")
+            print(json.dumps(message, indent=2, ensure_ascii=False))
+        
+        print(f"{'='*75}\n")
+    
+    def _display_generic_event(self, message: Dict[str, Any]):
+        """Display generic event"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        print(f"[{timestamp}] Event:")
+        print(json.dumps(message, indent=2, ensure_ascii=False))
+        print()
+    
+    def _print_event_data(self, data: Any, indent: int = 0):
+        """Recursively print event data"""
+        prefix = "  " * indent
+        
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if key in ['agent', 'pane_id', 'workspace_id', 'state', 'status', 
+                          'message', 'title', 'label', 'focused_pane_agent']:
+                    if isinstance(value, dict):
+                        print(f"{prefix}{key}:")
+                        self._print_event_data(value, indent + 1)
+                    else:
+                        print(f"{prefix}{key}: {value}")
+                elif isinstance(value, dict) and any(k in value for k in 
+                    ['agent', 'state', 'status']):
+                    self._print_event_data(value, indent)
+        
+        elif isinstance(data, list):
+            for item in data:
+                self._print_event_data(item, indent)
+        
+        else:
+            print(f"{prefix}{data}")
+    
+    def _print_header(self, text: str, level: str = "info"):
+        """Print formatted header"""
+        width = 75
+        symbols = {"info": "═", "success": "✓", "error": "✗", "warning": "⚠"}
+        symbol = symbols.get(level, "═")
+        
+        print(f"\n{symbol * width}")
+        print(f" {text}")
+        print(f"{symbol * width}\n")
+    
+    def _print_status(self, text: str, level: str = "info"):
+        """Print status message"""
+        icons = {
+            "info": "[*]",
+            "success": "[+]",
+            "error": "[!]",
+            "warning": "[⚠]"
+        }
+        
+        icon = icons.get(level, "[*]")
+        print(f"{icon} {text}")
+
+
+def print_banner():
+    """Print application banner"""
+    banner = r"""
+    ╔════════════════════════════════════════════════════════════════╗
+    ║                                                                ║
+    ║         🔍 Herdr Agent Status Monitor - Windows Edition 🔍      ║
+    ║                                                                ║
+    ║     Real-time monitoring of agent status changes via Socket    ║
+    ║                                                                ║
+    ╚════════════════════════════════════════════════════════════════╝
+    """
+    print(banner)
+
+
+def main():
+    """Main entry point"""
+    print_banner()
+    
+    # Parse arguments
+    verbose = '--verbose' in sys.argv
+    socket_path = None
+    
+    for arg in sys.argv[1:]:
+        if arg.startswith("--socket="):
+            socket_path = arg.split("=", 1)[1]
+    
+    # Create monitor
+    monitor = HerdrEventMonitor(socket_path)
+    
+    # Connect
+    if not monitor.connect():
+        print("\n[!] Failed to connect to Herdr")
+        print("\n[*] Troubleshooting tips:")
+        print("    1. Make sure Herdr is running")
+        print("    2. Check if Herdr socket exists at:")
+        if sys.platform == "win32":
+            print("       - \\\\.\\ pipe\\herdr (Windows named pipe)")
+            print("       - 127.0.0.1:7777, 127.0.0.1:12345 (TCP)")
+        else:
+            print("       - ~/.config/herdr/herdr.sock")
+        print("    3. Set HERDR_SOCKET_PATH environment variable if needed")
+        print("    4. Run with --verbose for debug output")
+        sys.exit(1)
+    
+    try:
+        # Subscribe to events
+        if monitor.subscribe_events():
+            # Run event loop
+            monitor.run()
+        else:
+            print("[!] Failed to subscribe to events")
+    
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"[!] Error: {e}")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+    
+    finally:
+        monitor.disconnect()
+        print("\n[*] Monitor stopped")
+
+
+if __name__ == "__main__":
+    main()
